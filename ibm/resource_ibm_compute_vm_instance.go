@@ -52,6 +52,8 @@ const (
 
 	virtualGuestAvailable    = "available"
 	virtualGuestProvisioning = "provisioning"
+	virtualGuestHalted       = "Halted"
+	virtualGuestRunning      = "Running"
 
 	networkStorageMassAccessControlModificationException = "SoftLayer_Exception_Network_Storage_Group_MassAccessControlModification"
 	retryDelayForModifyingStorageAccess                  = 10 * time.Second
@@ -461,6 +463,13 @@ func resourceIBMComputeVmInstance() *schema.Resource {
 				Optional: true,
 				Default:  true,
 				ForceNew: true,
+			},
+
+			"reboot_instance": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+				ForceNew: false,
 			},
 
 			"post_install_script_uri": {
@@ -1005,13 +1014,29 @@ func resourceIBMComputeVmInstanceCreate(d *schema.ResourceData, meta interface{}
 		}
 
 		// wait for machine availability
-
 		_, err = WaitForVirtualGuestAvailable(id, d, meta)
-
 		if err != nil {
 			return fmt.Errorf(
 				"Error waiting for virtual machine (%s) to become ready: %s", d.Id(), err)
 		}
+
+		// workaround to reboot worker role instances
+		if _, ok := d.GetOk("reboot_instance"); ok {
+			log.Printf("[INFO] Rebooting instance: %s", d.Id())
+			_, err := service.Id(id).RebootSoft()
+			if err != nil {
+				return fmt.Errorf("Error rebooting virtual guest: %s", err)
+			}
+
+			// wait for machine availability
+			_, err = WaitForActiveInstance(id, d, meta)
+
+			if err != nil {
+				return fmt.Errorf(
+					"Error waiting for virtual machine (%s) to become ready from reboot: %s", d.Id(), err)
+			}
+		}
+
 	}
 
 	return resourceIBMComputeVmInstanceRead(d, meta)
@@ -1591,6 +1616,31 @@ func WaitForUpgradeTransactionsToAppear(d *schema.ResourceData, meta interface{}
 		Timeout:    10 * time.Minute,
 		Delay:      5 * time.Second,
 		MinTimeout: 5 * time.Second,
+	}
+
+	return stateConf.WaitForState()
+}
+
+// WaitForActiveInstance Wait for instance to be ready from reboot
+func WaitForActiveInstance(id int, d *schema.ResourceData, meta interface{}) (interface{}, error) {
+	log.Printf("Waiting for server (%s) to be active", d.Id())
+	stateConf := &resource.StateChangeConf{
+		Pending: []string{"retry", virtualGuestHalted},
+		Target:  []string{virtualGuestRunning},
+		Refresh: func() (interface{}, string, error) {
+			service := services.GetVirtualGuestService(meta.(ClientSession).SoftLayerSession())
+			vmStatus, err := service.Id(id).Mask("name").GetPowerState()
+			if err != nil {
+				return nil, "", fmt.Errorf("Couldn't get instance %s status: %s", d.Id(), err)
+			}
+			if *vmStatus.Name == virtualGuestRunning {
+				return vmStatus, virtualGuestRunning, nil
+			}
+			return vmStatus, virtualGuestHalted, nil
+		},
+		Timeout:    time.Duration(d.Get("wait_time_minutes").(int)) * time.Minute,
+		Delay:      10 * time.Second,
+		MinTimeout: 10 * time.Second,
 	}
 
 	return stateConf.WaitForState()
